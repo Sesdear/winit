@@ -110,8 +110,12 @@ def_undocumented_cursor!(
     fn busyButClickableCursor();
 );
 
-// Note that loading `busybutclickable` with this code won't animate
-// the frames; instead you'll just get them all in a column.
+/// Loads a system cursor image and its independent hotx/hoty hotspot components.
+/// Missing or non-numeric hotspot components default individually to zero. Animated resources
+/// are loaded as one static image rather than separate frames.
+///
+/// # Safety
+/// The named system resource must provide an image and a readable cursor-info dictionary.
 unsafe fn load_webkit_cursor(name: &NSString) -> Retained<NSCursor> {
     // Snatch a cursor from WebKit; They fit the style of the native
     // cursors, and will seem completely standard to macOS users.
@@ -143,7 +147,7 @@ unsafe fn load_webkit_cursor(name: &NSString) -> Retained<NSCursor> {
         }
     }
     let mut y = 0.0;
-    if let Some(n) = info.get(&*ns_string!("hotx")) {
+    if let Some(n) = info.get(&*ns_string!("hoty")) {
         if n.is_kind_of::<NSNumber>() {
             let ptr: *const NSObject = n;
             let ptr: *const NSNumber = ptr.cast();

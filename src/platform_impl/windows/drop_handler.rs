@@ -17,7 +17,7 @@ use crate::platform_impl::platform::definitions::{
 };
 use crate::platform_impl::platform::WindowId;
 
-use crate::event::Event;
+use crate::event::{Event, WindowEvent};
 use crate::window::WindowId as RootWindowId;
 
 #[repr(C)]
@@ -76,17 +76,22 @@ impl FileDropHandler {
         count as u32
     }
 
+    /// Publishes the COM drag point before hover events and accepts file-list data for copying.
+    ///
+    /// # Safety
+    /// COM must supply a live handler, a valid IDataObject and a writable effect pointer.
     pub unsafe extern "system" fn DragEnter(
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::HoveredFile;
         let drop_handler = unsafe { Self::from_interface(this) };
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
+                drop_handler.file_drag_motion(pt);
                 drop_handler.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(drop_handler.window)),
                     event: HoveredFile(filename),
@@ -103,13 +108,20 @@ impl FileDropHandler {
         S_OK
     }
 
+    /// Updates physical cursor coordinates only while a valid file offer is hovering.
+    ///
+    /// # Safety
+    /// COM must supply a live handler and a writable effect pointer.
     pub unsafe extern "system" fn DragOver(
         this: *mut IDropTarget,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
+        if drop_handler.hovered_is_valid {
+            drop_handler.file_drag_motion(pt);
+        }
         unsafe {
             *pdwEffect = drop_handler.cursor_effect;
         }
@@ -126,21 +138,28 @@ impl FileDropHandler {
                 event: HoveredFileCancelled,
             });
         }
+        drop_handler.hovered_is_valid = false;
+        drop_handler.cursor_effect = DROPEFFECT_NONE;
 
         S_OK
     }
 
+    /// Replays the release point before each dropped filename, then clears hover state.
+    ///
+    /// # Safety
+    /// COM must supply a live handler and a valid IDataObject for the duration of this callback.
     pub unsafe extern "system" fn Drop(
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: POINTL,
         _pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::DroppedFile;
         let drop_handler = unsafe { Self::from_interface(this) };
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
+                drop_handler.file_drag_motion(pt);
                 drop_handler.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(drop_handler.window)),
                     event: DroppedFile(filename),
@@ -150,6 +169,8 @@ impl FileDropHandler {
         if let Some(hdrop) = hdrop {
             unsafe { DragFinish(hdrop) };
         }
+        drop_handler.hovered_is_valid = false;
+        drop_handler.cursor_effect = DROPEFFECT_NONE;
 
         S_OK
     }
@@ -211,6 +232,22 @@ impl FileDropHandler {
 }
 
 impl FileDropHandlerData {
+    /// Converts the by-value COM screen point to physical client pixels and emits CursorMoved.
+    /// Uses the current client origin without another DPI conversion or pointer-position query.
+    fn file_drag_motion(&self, point: POINTL) {
+        // IDropTarget receives POINTL by value, in physical screen coordinates. Reuse the
+        // existing safe client-area query, retaining the event's point rather than polling it.
+        let Ok(rect) = super::util::WindowArea::Inner.get_rect(self.window) else { return };
+        let position = crate::platform_impl::file_drop_position::screen_position(
+            (point.x, point.y),
+            (rect.left, rect.top),
+        );
+        self.send_event(Event::WindowEvent {
+            window_id: RootWindowId(WindowId(self.window)),
+            event: WindowEvent::CursorMoved { device_id: super::DEVICE_ID, position },
+        });
+    }
+
     fn send_event(&self, event: Event<()>) {
         (self.send_event)(event);
     }

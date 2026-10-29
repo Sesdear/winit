@@ -241,3 +241,35 @@ suite migrates to that API; do not vendor winit into consumers.
 Focused coverage: the Wayland `uri_list_*` unit tests and
 `cargo test --test wayland_file_drop_bounds`. Source guards check cleanup and
 setup rejection; live compositor failure injection remains separate.
+
+## Native file-drop coordinates and transfer lifetime (FigCraft #1435)
+
+These changes build on the bounded Wayland file-offer patch above and keep the
+existing `HoveredFile`, `DroppedFile` and cancellation API. A physical
+`CursorMoved` precedes accepted file events, so egui can place imported content
+at the released point rather than at a stale mouse position.
+
+- Wayland retains the surface-local logical point while the URI pipe is read,
+  and applies the receiving surface's current scale once on delivery. A leave
+  after release keeps the pending transfer; motion does not renegotiate actions.
+- X11 translates signed root coordinates to client pixels. One conversion is
+  pending per gesture, with its own temporary unmapped requestor window. Replies
+  are correlated to that window, source and timestamp. Fast drops wait for the
+  reply; cancellation and completion reset resources, and files are sent once.
+- Windows uses the by-value COM `POINTL` ABI and subtracts the client origin from
+  physical screen pixels without applying DPI scaling a second time.
+- macOS converts window logical dragging coordinates through the flipped content
+  view, then applies backing scale once. Drag callbacks return an `NSUInteger`
+  operation mask. WebKit Move/AllScroll and Cell cursors use `hoty` for the
+  vertical hotspot, preserving fallback to the system cursor.
+
+The original FigCraft vendoring baseline was `a517b384`; this migration retains
+all suite patches on `craft/0.30.13`. Vendor-only manifest edits, copied upstream
+files and unreferenced legacy modules are deliberately excluded. The behavioral
+changes are Apache-2.0, as recorded by the original FigCraft patch provenance.
+
+Focused checks: `cargo test --lib file_drop`, `cargo test --test file_drop_patches`
+and `cargo test --lib platform_impl::wayland::seat::dnd`. Source guards cover
+unavailable platform wiring; they do not substitute for native Windows/macOS or
+Wayland/X11 drag qualification. Remove these patches once a suite-compatible
+upstream winit release provides equivalent behavior.

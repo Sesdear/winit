@@ -1,6 +1,9 @@
 use crate::monitor::{MonitorHandle as RootMonitorHandle, VideoModeHandle as RootVideoModeHandle};
 use crate::window::Fullscreen as RootFullscreen;
 
+#[cfg(any(x11_platform, wayland_platform, windows_platform, macos_platform, test))]
+mod file_drop_position;
+
 #[cfg(android_platform)]
 mod android;
 #[cfg(ios_platform)]

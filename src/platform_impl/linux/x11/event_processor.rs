@@ -474,6 +474,8 @@ impl EventProcessor {
         }
     }
 
+    /// Dispatches window-manager messages and advances XDND gestures by source/target identity.
+    /// File positions come from XDND root pixels; release waits for its matching URI reply.
     fn client_message<T: 'static, F>(&mut self, xev: &XClientMessageEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -518,6 +520,11 @@ impl EventProcessor {
 
         if xev.message_type == atoms[XdndEnter] as c_ulong {
             let source_window = xev.data.get_long(0) as xproto::Window;
+            // A new offer cannot inherit files, a pending reply or coordinates from an old one.
+            if let Err(error) = self.dnd.begin_transfer(source_window, window) {
+                tracing::warn!(?error, "Failed to create XDND selection requestor");
+                return;
+            }
             let flags = xev.data.get_long(1);
             let version = flags >> 24;
             self.dnd.version = Some(version);
@@ -540,20 +547,14 @@ impl EventProcessor {
             // over our window. We emit HoveredFile in response; while the macOS backend
             // does that upon a drag entering, XDND doesn't have access to the actual drop
             // data until this event. For parity with other platforms, we only emit
-            // `HoveredFile` the first time, though if winit's API is later extended to
-            // supply position updates with `HoveredFile` or another event, implementing
-            // that here would be trivial.
+            // `HoveredFile` the first time. CursorMoved separately keeps the actual drag
+            // position available to clients without changing the file-event API.
 
             let source_window = xev.data.get_long(0) as xproto::Window;
-
-            // Equivalent to `(x << shift) | y`
-            // where `shift = mem::size_of::<c_short>() * 8`
-            // Note that coordinates are in "desktop space", not "window space"
-            // (in X11 parlance, they're root window coordinates)
-            // let packed_coordinates = xev.data.get_long(2);
-            // let shift = mem::size_of::<libc::c_short>() * 8;
-            // let x = packed_coordinates >> shift;
-            // let y = packed_coordinates & !(x << shift);
+            let Some(transfer) = self.dnd.transfer.as_ref() else { return };
+            if !transfer.matches(source_window, window) || transfer.dropped() {
+                return;
+            }
 
             // By our own state flow, `version` should never be `None` at this point.
             let version = self.dnd.version.unwrap_or(5);
@@ -577,21 +578,44 @@ impl EventProcessor {
                 return;
             }
 
+            // XDND packs signed physical root coordinates, including negative monitor origins.
+            // Translate through X11 rather than subtracting the decorated window's position.
+            let packed = xev.data.get_long(2) as u32;
+            let (root_x, root_y) =
+                crate::platform_impl::file_drop_position::xdnd_root_position(packed);
+            if let Ok(cookie) =
+                wt.xconn.xcb_connection().translate_coordinates(wt.root, window, root_x, root_y)
+            {
+                if let Ok(reply) = cookie.reply() {
+                    let position = PhysicalPosition::new(reply.dst_x as f64, reply.dst_y as f64);
+                    self.dnd.position = Some(position);
+                    callback(
+                        &self.target,
+                        Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::CursorMoved {
+                                device_id: mkdid(util::VIRTUAL_CORE_POINTER),
+                                position,
+                            },
+                        },
+                    );
+                }
+            }
+
             self.dnd.source_window = Some(source_window);
-            if self.dnd.result.is_none() {
-                let time = if version >= 1 {
-                    xev.data.get_long(3) as xproto::Timestamp
-                } else {
-                    // In version 0, time isn't specified
-                    x11rb::CURRENT_TIME
-                };
-
-                // Log this timestamp.
-                wt.xconn.set_timestamp(time);
-
-                // This results in the `SelectionNotify` event below
-                unsafe {
-                    self.dnd.convert_selection(window, time);
+            let time = if version >= 1 {
+                xev.data.get_long(3) as xproto::Timestamp
+            } else {
+                x11rb::CURRENT_TIME
+            };
+            if let Some(transfer) = self.dnd.transfer.as_mut() {
+                if transfer.request(time) {
+                    // Separate requestor storage survives until this conversion is consumed.
+                    let requestor = transfer.requestor();
+                    wt.xconn.set_timestamp(time);
+                    unsafe {
+                        self.dnd.convert_selection(requestor, time);
+                    }
                 }
             }
 
@@ -604,73 +628,181 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
-            let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
-                if let Some(Ok(ref path_list)) = self.dnd.result {
-                    for path in path_list {
-                        let event = Event::WindowEvent {
-                            window_id,
-                            event: WindowEvent::DroppedFile(path.clone()),
-                        };
-                        callback(&self.target, event);
-                    }
-                }
-                (source_window, DndState::Accepted)
-            } else {
-                // `source_window` won't be part of our DND state if we already rejected the drop in
-                // our `XdndPosition` handler.
-                let source_window = xev.data.get_long(0) as xproto::Window;
-                (source_window, DndState::Rejected)
-            };
-
-            unsafe {
-                self.dnd
-                    .send_finished(window, source_window, state)
-                    .expect("Failed to send `XdndFinished` message.");
+            // No active offer also covers duplicate Drop messages after completion.
+            if self.dnd.transfer.is_none() {
+                return;
             }
-
-            self.dnd.reset();
+            let source_window = xev.data.get_long(0) as xproto::Window;
+            let matching = self.dnd.source_window == Some(source_window)
+                && self
+                    .dnd
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.matches(source_window, window));
+            if !matching {
+                // Reject an unrelated source without canceling the current gesture.
+                unsafe {
+                    self.dnd
+                        .send_finished(window, source_window, DndState::Rejected)
+                        .expect("Failed to send `XdndFinished` message.");
+                }
+                return;
+            }
+            let position = self.dnd.position;
+            if self
+                .dnd
+                .transfer
+                .as_mut()
+                .is_some_and(|transfer| transfer.drop_at(source_window, window, position))
+            {
+                // SelectionNotify may arrive later. Keep this exact drop point and do not
+                // send XdndFinished until the matching URI conversion is complete.
+                self.finish_file_drop(&mut callback);
+            }
             return;
         }
 
         if xev.message_type == atoms[XdndLeave] as c_ulong {
-            self.dnd.reset();
-            let event = Event::WindowEvent { window_id, event: WindowEvent::HoveredFileCancelled };
-            callback(&self.target, event);
+            let source_window = xev.data.get_long(0) as xproto::Window;
+            let cancel = self.dnd.transfer.as_ref().is_some_and(|transfer| {
+                transfer.matches(source_window, window) && !transfer.dropped()
+            });
+            if cancel {
+                self.dnd.reset();
+                let event =
+                    Event::WindowEvent { window_id, event: WindowEvent::HoveredFileCancelled };
+                callback(&self.target, event);
+            }
         }
     }
 
+    /// Delivers a released, ready transfer once, replaying its frozen point before its files.
+    /// Consumes state before callbacks and acknowledges rejection when URI conversion failed.
+    fn finish_file_drop<T: 'static, F>(&mut self, callback: &mut F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let Some(dropped) = self.dnd.transfer.as_mut().and_then(|transfer| transfer.finish())
+        else {
+            return;
+        };
+        let result = self.dnd.result.take();
+        // Consume before callbacks, so duplicate Drop/SelectionNotify cannot deliver twice.
+        self.dnd.reset();
+        let window_id = mkwid(dropped.target);
+        let state = if let Some(Ok(paths)) = result {
+            if let Some(position) = dropped.position {
+                callback(
+                    &self.target,
+                    Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::CursorMoved {
+                            device_id: mkdid(util::VIRTUAL_CORE_POINTER),
+                            position,
+                        },
+                    },
+                );
+            }
+            for path in paths {
+                callback(
+                    &self.target,
+                    Event::WindowEvent { window_id, event: WindowEvent::DroppedFile(path) },
+                );
+            }
+            DndState::Accepted
+        } else {
+            callback(
+                &self.target,
+                Event::WindowEvent { window_id, event: WindowEvent::HoveredFileCancelled },
+            );
+            DndState::Rejected
+        };
+        unsafe {
+            self.dnd
+                .send_finished(dropped.target, dropped.source, state)
+                .expect("Failed to send `XdndFinished` message.");
+        }
+    }
+
+    /// Consumes URI data only for the current requestor, timestamp and selection owner.
+    /// A reply can complete a waiting drop or publish hover data while release is still pending.
     fn selection_notify<T: 'static, F>(&mut self, xev: &XSelectionEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
         let atoms = wt.xconn.atoms();
-
-        let window = xev.requestor as xproto::Window;
-        let window_id = mkwid(window);
-
-        // Set the timestamp.
-        wt.xconn.set_timestamp(xev.time as xproto::Timestamp);
-
-        if xev.property != atoms[XdndSelection] as c_ulong {
+        let requestor = xev.requestor as xproto::Window;
+        let time = xev.time as xproto::Timestamp;
+        if xev.selection != atoms[XdndSelection] as c_ulong
+            || xev.target != atoms[TextUriList] as c_ulong
+            || (xev.property != 0 && xev.property != atoms[XdndSelection] as c_ulong)
+        {
             return;
         }
-
-        // This is where we receive data from drag and drop
-        self.dnd.result = None;
-        if let Ok(mut data) = unsafe { self.dnd.read_data(window) } {
-            let parse_result = self.dnd.parse_data(&mut data);
-            if let Ok(ref path_list) = parse_result {
-                for path in path_list {
-                    let event = Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::HoveredFile(path.clone()),
-                    };
-                    callback(&self.target, event);
+        let Some(transfer) = self.dnd.transfer.as_ref() else { return };
+        if !transfer.expects_reply(requestor, time) {
+            return;
+        }
+        let window = transfer.target();
+        // Keep cookie lifetimes inside this block, before mutating the event processor.
+        let owner = {
+            let Ok(cookie) = wt.xconn.xcb_connection().get_selection_owner(atoms[XdndSelection])
+            else {
+                return;
+            };
+            let Ok(owner) = cookie.reply() else { return };
+            owner.owner
+        };
+        if owner != transfer.source() {
+            // The source must retain the selection until Finished. Never import data from
+            // its replacement; complete a pending drop as rejected or cancel the hover.
+            if transfer.dropped() {
+                if let Some(transfer) = self.dnd.transfer.as_mut() {
+                    transfer.receive_reply(requestor, time);
+                }
+                self.dnd.result = Some(Err(super::dnd::DndDataParseError::EmptyData));
+                self.finish_file_drop(&mut callback);
+            } else {
+                self.dnd.reset();
+                callback(
+                    &self.target,
+                    Event::WindowEvent {
+                        window_id: mkwid(window),
+                        event: WindowEvent::HoveredFileCancelled,
+                    },
+                );
+            }
+            return;
+        }
+        let Some(transfer) = self.dnd.transfer.as_mut() else { return };
+        if !transfer.receive_reply(requestor, time) {
+            return;
+        }
+        let dropped = transfer.dropped();
+        wt.xconn.set_timestamp(time);
+        let result = if xev.property == 0 {
+            Err(super::dnd::DndDataParseError::EmptyData)
+        } else if let Ok(mut data) = unsafe { self.dnd.read_data(requestor) } {
+            self.dnd.parse_data(&mut data)
+        } else {
+            Err(super::dnd::DndDataParseError::EmptyData)
+        };
+        if !dropped {
+            if let Ok(paths) = &result {
+                for path in paths {
+                    callback(
+                        &self.target,
+                        Event::WindowEvent {
+                            window_id: mkwid(window),
+                            event: WindowEvent::HoveredFile(path.clone()),
+                        },
+                    );
                 }
             }
-            self.dnd.result = Some(parse_result);
         }
+        self.dnd.result = Some(result);
+        self.finish_file_drop(&mut callback);
     }
 
     fn configure_notify<T: 'static, F>(&self, xev: &XConfigureEvent, mut callback: F)

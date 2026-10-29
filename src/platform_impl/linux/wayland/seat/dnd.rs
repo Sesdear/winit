@@ -24,6 +24,7 @@ use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
+use crate::dpi::LogicalPosition;
 use crate::event::WindowEvent;
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{make_wid, WindowId};
@@ -45,6 +46,8 @@ fn reject_file_offer(offer: &DragOffer, conn: &Connection) {
 pub struct FileDrag {
     offer: DragOffer,
     window_id: WindowId,
+    /// Latest surface-local logical position, retained while URI data is read asynchronously.
+    position: LogicalPosition<f64>,
     /// The files in the drag, once the list has been read.
     paths: Option<Vec<PathBuf>>,
     /// Bytes of the list read so far.
@@ -58,6 +61,25 @@ pub struct FileDrag {
 }
 
 impl WinitState {
+    /// Emits a physical cursor point using the receiving surface's current scale factor.
+    fn file_drag_motion(&mut self, window_id: WindowId, position: LogicalPosition<f64>) {
+        let Some(window) = self.windows.get_mut().get(&window_id) else { return };
+        let Ok(window) = window.lock() else { return };
+        let Some(position) = crate::platform_impl::file_drop_position::logical_position(
+            position.x,
+            position.y,
+            window.scale_factor(),
+        ) else {
+            return;
+        };
+        let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(
+            crate::platform_impl::wayland::DeviceId,
+        ));
+        self.events_sink
+            .push_window_event(WindowEvent::CursorMoved { device_id, position }, window_id);
+        self.dispatched_events = true;
+    }
+
     /// Ends the file drag of a seat without dropping it.
     pub(super) fn cancel_file_drag(&mut self, seat: &ObjectId) {
         let Some(drag) = self.seats.get_mut(seat).and_then(|seat| seat.file_drag.take()) else {
@@ -105,6 +127,9 @@ impl WinitState {
         }
         drag.offer.destroy();
 
+        // Reading the URI list may finish after a leave or another pointer event. Restore the
+        // actual drop position immediately before delivering the corresponding files.
+        self.file_drag_motion(drag.window_id, drag.position);
         for path in drag.paths.unwrap_or_default() {
             self.events_sink.push_window_event(WindowEvent::DroppedFile(path), drag.window_id);
         }
@@ -170,8 +195,8 @@ impl DataDeviceHandler for WinitState {
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
         surface: &WlSurface,
     ) {
         let data = data_device.data::<DataDeviceData>().unwrap();
@@ -220,12 +245,14 @@ impl DataDeviceHandler for WinitState {
         seat_state.file_drag = Some(FileDrag {
             offer,
             window_id,
+            position: LogicalPosition::new(x, y),
             paths: None,
             buffer: Vec::new(),
             reader: Some(reader),
             hovered: false,
             dropped: false,
         });
+        self.file_drag_motion(window_id, LogicalPosition::new(x, y));
     }
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, data_device: &WlDataDevice) {
@@ -241,20 +268,25 @@ impl DataDeviceHandler for WinitState {
         }
     }
 
+    /// Retains the surface-local point during asynchronous reading and reaffirms MIME acceptance
+    /// without restarting action negotiation, which can interrupt a quick drop.
     fn motion(
         &mut self,
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
     ) {
         let seat = data_device.data::<DataDeviceData>().unwrap().seat().id();
         // Some compositors want the type accepted again as the drag moves. The actions are not
         // set again: that restarts the negotiation and can turn a quick drop into a leave.
-        if let Some(drag) = self.seats.get(&seat).and_then(|seat| seat.file_drag.as_ref()) {
+        if let Some(drag) = self.seats.get_mut(&seat).and_then(|seat| seat.file_drag.as_mut()) {
+            drag.position = LogicalPosition::new(x, y);
+            let window_id = drag.window_id;
             drag.offer.accept_mime_type(drag.offer.serial, Some(URI_LIST.to_owned()));
             let _ = conn.flush();
+            self.file_drag_motion(window_id, LogicalPosition::new(x, y));
         }
     }
 

@@ -368,7 +368,7 @@ declare_class!(
     unsafe impl NSDraggingDestination for WindowDelegate {
         /// Invoked when the dragged image enters destination bounds or frame
         #[method(draggingEntered:)]
-        fn dragging_entered(&self, sender: &NSObject) -> bool {
+        fn dragging_entered(&self, sender: &NSObject) -> usize {
             trace_scope!("draggingEntered:");
 
             use std::path::PathBuf;
@@ -376,16 +376,29 @@ declare_class!(
             let pb: Retained<NSPasteboard> = unsafe { msg_send_id![sender, draggingPasteboard] };
             let filenames = match pb.propertyListForType(unsafe { NSFilenamesPboardType }) {
                 Some(filenames) => filenames,
-                None => return false.into(),
+                None => return 0,
             };
             let filenames: Retained<NSArray<NSString>> = unsafe { Retained::cast(filenames) };
 
+            self.file_drag_motion(sender);
             filenames.into_iter().for_each(|file| {
                 let path = PathBuf::from(file.to_string());
                 self.queue_event(WindowEvent::HoveredFile(path));
             });
 
-            true
+            // NSDragOperationCopy. Cocoa expects an NSUInteger operation mask, not BOOL.
+            1
+        }
+
+        /// Tracks file-drag coordinates and returns the NSUInteger copy-operation mask.
+        #[method(draggingUpdated:)]
+        fn dragging_updated(&self, sender: &NSObject) -> usize {
+            let pb: Retained<NSPasteboard> = unsafe { msg_send_id![sender, draggingPasteboard] };
+            if pb.propertyListForType(unsafe { NSFilenamesPboardType }).is_none() {
+                return 0;
+            }
+            self.file_drag_motion(sender);
+            1
         }
 
         /// Invoked when the image is released
@@ -409,6 +422,7 @@ declare_class!(
             };
             let filenames: Retained<NSArray<NSString>> = unsafe { Retained::cast(filenames) };
 
+            self.file_drag_motion(sender);
             filenames.into_iter().for_each(|file| {
                 let path = PathBuf::from(file.to_string());
                 self.queue_event(WindowEvent::DroppedFile(path));
@@ -820,6 +834,22 @@ impl WindowDelegate {
 
     pub(crate) fn queue_event(&self, event: WindowEvent) {
         self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
+    }
+
+    /// Replays an NSDraggingInfo window point in flipped view coordinates, scaled once to pixels.
+    /// Call only from dragging-destination callbacks whose sender implements NSDraggingInfo.
+    fn file_drag_motion(&self, sender: &NSObject) {
+        // SAFETY: Only NSDraggingDestination callbacks pass their NSDraggingInfo sender here.
+        // Its draggingLocation is window-local logical points, not global screen coordinates.
+        let window_point: NSPoint = unsafe { objc2::msg_send![sender, draggingLocation] };
+        let point = self.view().convertPoint_fromView(window_point, None);
+        if let Some(position) = crate::platform_impl::file_drop_position::logical_position(
+            point.x,
+            point.y,
+            self.scale_factor(),
+        ) {
+            self.queue_event(WindowEvent::CursorMoved { device_id: super::DEVICE_ID, position });
+        }
     }
 
     fn handle_scale_factor_changed(&self, scale_factor: CGFloat) {

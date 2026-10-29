@@ -40,6 +40,7 @@ mod activation;
 mod atoms;
 mod dnd;
 mod event_processor;
+mod file_drop_state;
 pub mod ffi;
 mod ime;
 mod monitor;

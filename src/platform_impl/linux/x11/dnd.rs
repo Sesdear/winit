@@ -9,7 +9,9 @@ use x11rb::protocol::xproto::{self, ConnectionExt};
 
 use super::atoms::AtomName::None as DndNone;
 use super::atoms::*;
+use super::file_drop_state::FileDropTransfer;
 use super::{util, CookieResultExt, X11Error, XConnection};
+use crate::dpi::PhysicalPosition;
 
 #[derive(Debug, Clone, Copy)]
 pub enum DndState {
@@ -45,20 +47,53 @@ pub struct Dnd {
     pub type_list: Option<Vec<xproto::Atom>>,
     // Populated by XdndPosition event handler
     pub source_window: Option<xproto::Window>,
+    pub position: Option<PhysicalPosition<f64>>,
+    pub(super) transfer: Option<FileDropTransfer>,
+    requestor: Option<FileDropRequestor>,
     // Populated by SelectionNotify event handler (triggered by XdndPosition event handler)
     pub result: Option<Result<Vec<PathBuf>, DndDataParseError>>,
 }
 
 impl Dnd {
+    /// Creates idle XDND state; no requestor window is allocated until a gesture begins.
     pub fn new(xconn: Arc<XConnection>) -> Result<Self, X11Error> {
-        Ok(Dnd { xconn, version: None, type_list: None, source_window: None, result: None })
+        Ok(Dnd {
+            xconn,
+            version: None,
+            type_list: None,
+            source_window: None,
+            position: None,
+            transfer: None,
+            requestor: None,
+            result: None,
+        })
     }
 
+    /// Cancels pending data and coordinates, destroying the gesture's private requestor window.
     pub fn reset(&mut self) {
         self.version = None;
         self.type_list = None;
         self.source_window = None;
+        self.position = None;
+        self.transfer = None;
+        self.requestor = None;
         self.result = None;
+    }
+
+    /// Replaces any old gesture with isolated selection-property storage for this source/target.
+    /// If requestor creation fails, the old transfer has already been released and state is idle.
+    pub(super) fn begin_transfer(
+        &mut self,
+        source: xproto::Window,
+        target: xproto::Window,
+    ) -> Result<(), X11Error> {
+        self.reset();
+        // Each conversion owns separate property storage. A delayed, canceled source
+        // cannot overwrite the next gesture's data before its SelectionNotify is read.
+        let requestor = FileDropRequestor::new(Arc::clone(&self.xconn))?;
+        self.transfer = Some(FileDropTransfer::new(source, target, requestor.window));
+        self.requestor = Some(requestor);
+        Ok(())
     }
 
     pub unsafe fn send_status(
@@ -169,6 +204,43 @@ impl Dnd {
             Ok(path_list)
         } else {
             Err(DndDataParseError::EmptyData)
+        }
+    }
+}
+
+/// An unmapped selection requestor, destroyed on cancellation/completion or Dnd drop.
+struct FileDropRequestor {
+    xconn: Arc<XConnection>,
+    window: xproto::Window,
+}
+
+impl FileDropRequestor {
+    /// Creates an unmapped input-only window; the temporary wrapper cleans up creation failure.
+    fn new(xconn: Arc<XConnection>) -> Result<Self, X11Error> {
+        let (window, cookie) = xproto::WindowWrapper::create_window_and_get_cookie(
+            xconn.xcb_connection(),
+            0,
+            xconn.default_root().root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new(),
+        )?;
+        cookie.check()?;
+        let window = window.into_window();
+        Ok(Self { xconn, window })
+    }
+}
+
+impl Drop for FileDropRequestor {
+    /// Releases server-side property storage on cancellation, completion or backend teardown.
+    fn drop(&mut self) {
+        if let Ok(cookie) = self.xconn.xcb_connection().destroy_window(self.window) {
+            cookie.ignore_error();
         }
     }
 }
