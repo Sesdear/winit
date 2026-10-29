@@ -221,3 +221,23 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+## Bounded Wayland file offers (FigCraft #1435)
+
+File URI lists are capped at 1 MiB before extending the buffer. Oversized lists
+follow permanent read errors: discard the bytes, complete with no files, advance
+the drag state and return `PostAction::Remove`, which drops the pipe reader.
+Transient `Interrupted` and `WouldBlock` results keep the source registered.
+
+Failed pipe creation or event-source registration withdraws MIME acceptance and
+flushes, as for unsupported offers. A reader registered for a vanished seat is
+removed first. These pre-drop paths do not call protocol `finish` or `destroy`.
+
+Ported from FigCraft PR #1435 on the suite's compatible `craft/0.30.13` branch
+(`ad81a325`, tree equal to FigCraft's original `a517b384` pin). The repository's
+`master` has the incompatible split-crate 0.31 API. Revisit this patch when the
+suite migrates to that API; do not vendor winit into consumers.
+
+Focused coverage: the Wayland `uri_list_*` unit tests and
+`cargo test --test wayland_file_drop_bounds`. Source guards check cleanup and
+setup rejection; live compositor failure injection remains separate.
