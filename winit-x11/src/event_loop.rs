@@ -863,16 +863,12 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
             state.pending_fetch_types.push_back((serial, type_));
 
-            should_emit_convert_selection.then_some((
-                state.target_window,
-                self.xconn.timestamp(),
-                atom,
-            ))
+            should_emit_convert_selection.then_some((self.xconn.timestamp(), atom))
         };
 
-        if let Some((window, time, new_type)) = new_convert_selection {
+        if let Some((time, new_type)) = new_convert_selection {
             // This results in the `SelectionNotify` event
-            dnd.convert_selection(window, time, new_type);
+            dnd.convert_selection(time, new_type);
         }
 
         Ok(serial)
