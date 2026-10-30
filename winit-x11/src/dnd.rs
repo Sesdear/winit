@@ -47,16 +47,32 @@ impl From<io::Error> for UriListParseError {
 #[derive(Debug)]
 pub struct SelectionReader {
     type_: SelectionType,
-    data: Vec<u8>,
+    data: io::Result<Vec<u8>>,
+}
+
+impl SelectionReader {
+    /// Completes a failed conversion with readable error state instead of losing its serial.
+    pub fn failed(type_: SelectionType, error: io::Error) -> Self {
+        Self { type_, data: Err(error) }
+    }
+
+    /// Borrows successful data while preserving a failed conversion's error on every access.
+    fn bytes(&self) -> io::Result<&[u8]> {
+        self.data.as_deref().map_err(|err| io::Error::new(err.kind(), err.to_string()))
+    }
 }
 
 impl TypedData for SelectionReader {
     fn try_read(&self) -> Option<Box<dyn io::BufRead>> {
-        Some(Box::new(io::Cursor::new(self.data.clone())))
+        Some(Box::new(io::Cursor::new(self.data.as_ref().ok()?.clone())))
     }
 
     fn type_(&self) -> &dyn TransferType {
         &self.type_
+    }
+
+    fn try_as_bytes(&self) -> io::Result<Vec<u8>> {
+        self.bytes().map(ToOwned::to_owned)
     }
 
     fn try_as_string(&self) -> io::Result<String> {
@@ -78,12 +94,13 @@ impl TypedData for SelectionReader {
             String::from_utf16(&utf16).map_err(invalid_data)
         }
 
+        let data = self.bytes()?;
         match self.type_.hint() {
-            Some(TypeHint::Plaintext) | Some(TypeHint::Html) => std::str::from_utf8(&self.data)
+            Some(TypeHint::Plaintext) | Some(TypeHint::Html) => std::str::from_utf8(data)
                 .map(|str| str.to_owned())
                 .map_err(invalid_data)
-                .or_else(|_| decode_utf16_bytes(&self.data)),
-            Some(TypeHint::UriList) => String::from_utf8(self.data.clone()).map_err(invalid_data),
+                .or_else(|_| decode_utf16_bytes(data)),
+            Some(TypeHint::UriList) => String::from_utf8(data.to_vec()).map_err(invalid_data),
             _ => Err(io::ErrorKind::InvalidData.into()),
         }
     }
@@ -114,9 +131,13 @@ pub struct DragState {
     pub target_window: xproto::Window,
     // Populated by `fetch_data_transfer`
     pub pending_fetch_types: VecDeque<(AsyncRequestSerial, SelectionType)>,
+    /// Private property storage, unique to this drag, so canceled sources cannot overwrite it.
+    pub requestor_window: xproto::Window,
+    /// Timestamp of the selection conversion currently awaiting a reply.
+    pub pending_request_time: Option<xproto::Timestamp>,
+    /// Released target/source pair, retained until pending conversions have completed.
     pub finished: Option<(XWindow, XWindow)>,
-    /// Whether the drag operation is accepted (or `None` if the user never indicated that it's
-    /// accepted or rejected)
+    /// Whether the application accepted the drag operation.
     // Populated by `Window::accept_drag`/`Window::reject_drag`.
     pub accepted: bool,
 }
@@ -132,9 +153,39 @@ impl Default for DragState {
             source_window: Default::default(),
             target_window: Default::default(),
             pending_fetch_types: Default::default(),
+            requestor_window: Default::default(),
+            pending_request_time: None,
             finished: None,
             accepted: Default::default(),
         }
+    }
+}
+
+impl DragState {
+    /// Matches only the current, not-yet-dropped source/target pair.
+    pub fn matches_drag(&self, source: xproto::Window, target: xproto::Window) -> bool {
+        self.source_window == source && self.target_window == target && self.finished.is_none()
+    }
+
+    /// Consumes one reply only after its requestor, requested type, and timestamp match.
+    /// `CURRENT_TIME` requests have no known server timestamp to compare against.
+    pub fn take_selection_reply(
+        &mut self,
+        requestor: xproto::Window,
+        target_type: xproto::Atom,
+        time: xproto::Timestamp,
+    ) -> Option<(AsyncRequestSerial, SelectionType)> {
+        if self.requestor_window != requestor
+            || !self
+                .pending_request_time
+                .is_some_and(|requested| requested == x11rb::CURRENT_TIME || requested == time)
+            || self.pending_fetch_types.front()?.1.atom() != target_type
+        {
+            return None;
+        }
+
+        self.pending_request_time = None;
+        self.pending_fetch_types.pop_front()
     }
 }
 
@@ -143,6 +194,7 @@ pub struct Dnd {
     xconn: Arc<XConnection>,
     // If `None`, no drag operation is in progress.
     state: Option<DragState>,
+    requestor: Option<SelectionRequestor>,
 }
 
 #[derive(Debug)]
@@ -237,7 +289,7 @@ impl DataTransfer for Selection {
 
 impl Dnd {
     pub fn new(xconn: Arc<XConnection>) -> Self {
-        Dnd { xconn, state: None }
+        Dnd { xconn, state: None, requestor: None }
     }
 
     pub fn state(&self) -> Option<&DragState> {
@@ -252,23 +304,31 @@ impl Dnd {
         self.state.as_ref()?.types.iter().find(|haystack| haystack.hint() == Some(hint))
     }
 
+    /// Starts a drag with separate server-side storage, dropping any canceled requestor first.
     pub fn init_state(
         &mut self,
         version: c_long,
         source_window: xproto::Window,
         target_window: xproto::Window,
         types: Arc<[SelectionType]>,
-    ) -> &DragState {
-        self.state.insert(DragState {
+    ) -> Result<&DragState, X11Error> {
+        self.reset_state();
+        let requestor = SelectionRequestor::new(Arc::clone(&self.xconn))?;
+        let requestor_window = requestor.window;
+        self.requestor = Some(requestor);
+        Ok(self.state.insert(DragState {
             version,
             types,
             source_window,
             target_window,
+            requestor_window,
             ..Default::default()
-        })
+        }))
     }
 
+    /// Cancels or completes the drag and releases its private selection properties.
     pub fn reset_state(&mut self) -> Option<DragState> {
+        self.requestor = None;
         self.state.take()
     }
 
@@ -310,18 +370,24 @@ impl Dnd {
         )
     }
 
-    pub fn convert_selection(
-        &self,
-        window: xproto::Window,
-        time: xproto::Timestamp,
-        new_type: xproto::Atom,
-    ) {
+    /// Requests the next queued type in storage isolated from canceled drag sources.
+    pub fn convert_selection(&mut self, time: xproto::Timestamp, new_type: xproto::Atom) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        state.pending_request_time = Some(time);
+        let requestor = state.requestor_window;
         let atoms = self.xconn.atoms();
         self.xconn
             .xcb_connection()
-            // TODO: We store the converted selection back to `XdndSelection`. We should store to
-            // some new place so that `XdndSelection` remains untouched.
-            .convert_selection(window, atoms[XdndSelection], new_type, atoms[XdndSelection], time)
+            // The property belongs to a private requestor, not the application's window.
+            .convert_selection(
+                requestor,
+                atoms[XdndSelection],
+                new_type,
+                atoms[XdndSelection],
+                time,
+            )
             .expect_then_ignore_error("Failed to send XdndSelection event")
     }
 
@@ -358,6 +424,147 @@ impl Dnd {
         let type_atom = type_.atom();
         let bytes = self.xconn.get_property(window, atoms[XdndSelection], type_atom)?;
 
-        Ok(SelectionReader { type_, data: bytes })
+        Ok(SelectionReader { type_, data: Ok(bytes) })
+    }
+}
+
+/// Owns a drag's unmapped requestor and destroys its properties on every terminal path.
+#[derive(Debug)]
+struct SelectionRequestor {
+    xconn: Arc<XConnection>,
+    window: xproto::Window,
+}
+
+impl SelectionRequestor {
+    /// Creates an input-only window; the temporary wrapper cleans up if creation is rejected.
+    fn new(xconn: Arc<XConnection>) -> Result<Self, X11Error> {
+        let (window, cookie) = xproto::WindowWrapper::create_window_and_get_cookie(
+            xconn.xcb_connection(),
+            0,
+            xconn.default_root().root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new(),
+        )?;
+        cookie.check()?;
+        let window = window.into_window();
+        Ok(Self { xconn, window })
+    }
+}
+
+impl Drop for SelectionRequestor {
+    fn drop(&mut self) {
+        if let Ok(cookie) = self.xconn.xcb_connection().destroy_window(self.window) {
+            cookie.ignore_error();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(requestor_window: xproto::Window) -> DragState {
+        DragState {
+            source_window: 1,
+            target_window: 2,
+            requestor_window,
+            pending_request_time: Some(42),
+            pending_fetch_types: VecDeque::from([
+                (AsyncRequestSerial::get(), SelectionType {
+                    hint: Some(TypeHint::UriList),
+                    atom: 3,
+                }),
+                (AsyncRequestSerial::get(), SelectionType {
+                    hint: Some(TypeHint::Plaintext),
+                    atom: 4,
+                }),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drag_messages_require_matching_source_and_target() {
+        let state = state(10);
+        assert!(state.matches_drag(1, 2));
+        assert!(!state.matches_drag(9, 2));
+        assert!(!state.matches_drag(1, 9));
+    }
+
+    #[test]
+    fn dropped_transfer_ignores_duplicate_drop_motion_and_leave() {
+        let mut state = state(10);
+        state.finished = Some((2, 1));
+        assert!(!state.matches_drag(1, 2));
+        // The pending conversion remains valid after release.
+        assert!(state.take_selection_reply(10, 3, 42).is_some());
+        assert_eq!(state.finished, Some((2, 1)));
+    }
+
+    #[test]
+    fn unrelated_reply_does_not_consume_pending_fetch() {
+        let mut state = state(10);
+        assert!(state.take_selection_reply(11, 3, 42).is_none());
+        assert!(state.take_selection_reply(10, 4, 42).is_none());
+        assert!(state.take_selection_reply(10, 3, 43).is_none());
+        assert_eq!(state.pending_fetch_types.len(), 2);
+        assert_eq!(state.pending_request_time, Some(42));
+    }
+
+    #[test]
+    fn each_conversion_completes_once_before_next_type_is_requested() {
+        let mut state = state(10);
+        assert!(state.take_selection_reply(10, 3, 42).is_some());
+        assert!(state.take_selection_reply(10, 3, 42).is_none());
+        assert!(state.take_selection_reply(10, 4, 42).is_none());
+        assert_eq!(state.pending_fetch_types.len(), 1);
+        // A failed conversion uses the same completion path, so it cannot block the next type.
+        state.pending_request_time = Some(43);
+        assert!(state.take_selection_reply(10, 4, 43).is_some());
+        assert!(state.pending_fetch_types.is_empty());
+    }
+
+    #[test]
+    fn canceled_requestor_cannot_complete_later_drag() {
+        let mut next = state(11);
+        assert!(next.take_selection_reply(10, 3, 42).is_none());
+        assert!(next.take_selection_reply(11, 3, 42).is_some());
+    }
+
+    #[test]
+    fn current_time_conversion_accepts_the_server_timestamp() {
+        let mut state = state(10);
+        state.pending_request_time = Some(x11rb::CURRENT_TIME);
+        assert!(state.take_selection_reply(10, 3, 123).is_some());
+    }
+
+    #[test]
+    fn failed_conversion_reports_error_for_each_data_access() {
+        let reader = SelectionReader::failed(
+            SelectionType { hint: Some(TypeHint::UriList), atom: 3 },
+            io::Error::other("Selection conversion refused"),
+        );
+        assert!(reader.try_read().is_none());
+        assert!(reader.try_as_bytes().is_err());
+        assert!(reader.try_as_string().is_err());
+        assert!(reader.try_as_uris().is_err());
+        assert_eq!(reader.type_().hint(), Some(TypeHint::UriList));
+    }
+
+    #[test]
+    fn successful_selection_preserves_bytes_and_uris() {
+        let data = b"file:///tmp/a%20b.png\r\nfile:///tmp/c.svg\r\n".to_vec();
+        let reader = SelectionReader {
+            type_: SelectionType { hint: Some(TypeHint::UriList), atom: 3 },
+            data: Ok(data.clone()),
+        };
+        assert_eq!(reader.try_as_bytes().unwrap(), data);
+        assert_eq!(reader.try_as_uris().unwrap(), ["file:///tmp/a%20b.png", "file:///tmp/c.svg"]);
     }
 }

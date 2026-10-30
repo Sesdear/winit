@@ -1,7 +1,7 @@
 //! The event-loop routines.
 
 use std::cell::{Cell, RefCell};
-use std::io::{self, Read, Result as IOResult};
+use std::io::Result as IOResult;
 use std::mem;
 use std::ops::BitOr;
 use std::os::fd::OwnedFd;
@@ -46,6 +46,7 @@ use crate::{DragSource, MimeType, image_to_buffer, make_data_transfer_id};
 
 mod proxy;
 pub mod sink;
+mod transfer;
 
 use proxy::EventLoopProxy;
 use sink::EventSink;
@@ -803,44 +804,54 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
         let mime_type_str = mime_type.to_string();
 
-        // create a pipe
+        // A compositor may already have accepted this offer through set_valid_dnd_actions.
+        // Withdraw that acceptance if no reader can be installed; never finish an undropped offer.
+        let reject = || {
+            current_drag.accept(current_drag.serial(), None);
+            let _ = self.handle.connection.flush();
+        };
         let (readfd, writefd) =
-            pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map_err(|e| os_error!(e))?;
+            pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map_err(|e| {
+                reject();
+                os_error!(e)
+            })?;
 
         let async_request_serial = AsyncRequestSerial::get();
 
         let mut buffer = Vec::new();
         let window_id = current_drag.window_id();
+        let limit = transfer::size_limit(&mime_type_str);
         let mut mime_type = Some(mime_type.clone());
 
-        let _ = state.loop_handle.insert_source(ReadPipe::from(readfd), move |_, file, state| {
-            // SAFETY: We do not overwrite the referent of `file`
-            let file = unsafe { file.get_mut() };
+        let reader =
+            state.loop_handle.insert_source(ReadPipe::from(readfd), move |_, file, state| {
+                // SAFETY: We do not overwrite the referent of `file`
+                let file = unsafe { file.get_mut() };
 
-            let result = match file.read_to_end(&mut buffer) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return PostAction::Continue;
-                },
-                Ok(0) => Ok(mem::take(&mut buffer)),
-                Ok(_) => {
-                    return PostAction::Continue;
-                },
-                Err(e) => Err(Arc::new(e)),
-            };
+                let result = match transfer::read_available(file, &mut buffer, limit) {
+                    Ok(None) => return PostAction::Continue,
+                    Ok(Some(data)) => Ok(data),
+                    Err(e) => Err(Arc::new(e)),
+                };
 
-            state.events_sink.push_window_event(
-                WindowEvent::DataTransferReceived {
-                    id,
-                    serial: async_request_serial,
-                    // `unwrap` is safe here, as we always return `PostAction::Remove` in this
-                    // branch.
-                    value: Arc::new(MimeData::new(mime_type.take().unwrap(), result)),
-                },
-                window_id,
-            );
+                state.events_sink.push_window_event(
+                    WindowEvent::DataTransferReceived {
+                        id,
+                        serial: async_request_serial,
+                        // `unwrap` is safe here, as we always return `PostAction::Remove` in this
+                        // branch.
+                        value: Arc::new(MimeData::new(mime_type.take().unwrap(), result)),
+                    },
+                    window_id,
+                );
 
-            PostAction::Remove
-        });
+                PostAction::Remove
+            });
+        if let Err(error) = reader {
+            reject();
+            // Dropping InsertError releases its unregistered ReadPipe, while writefd is local.
+            return Err(os_error!(error.error).into());
+        }
 
         current_drag.accept(current_drag.serial(), Some(mime_type_str.clone()));
         data_offer::receive_to_fd(current_drag, mime_type_str, writefd);

@@ -34,7 +34,7 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
-use crate::dnd::{DndState, SelectionType};
+use crate::dnd::{DndState, SelectionReader, SelectionType};
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -457,7 +457,13 @@ impl EventProcessor {
                     Default::default()
                 };
 
-                dnd.init_state(version, source_window, window, types.into()).transfer_id
+                match dnd.init_state(version, source_window, window, types.into()) {
+                    Ok(state) => state.transfer_id,
+                    Err(err) => {
+                        warn!("Failed to initialize drag selection requestor: {err}");
+                        return;
+                    },
+                }
             };
 
             app.window_event(&self.target, window_id, WindowEvent::DragEntered {
@@ -468,15 +474,17 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndPosition] as c_ulong {
-            // This event occurs every time the mouse moves while a file's being dragged
-            // over our window. We emit HoveredFile in response; while the macOS backend
-            // does that upon a drag entering, XDND doesn't have access to the actual drop
-            // data until this event. For parity with other platforms, we only emit
-            // `HoveredFile` the first time, though if winit's API is later extended to
-            // supply position updates with `HoveredFile` or another event, implementing
-            // that here would be trivial.
-
             let source_window = xev.data.get_long(0) as xproto::Window;
+
+            if !self
+                .target
+                .dnd
+                .borrow()
+                .state()
+                .is_some_and(|state| state.matches_drag(source_window, window))
+            {
+                return;
+            }
 
             // https://www.freedesktop.org/wiki/Specifications/XDND/#xdndposition
             // Note that coordinates are in "desktop space", not "window space"
@@ -539,39 +547,34 @@ impl EventProcessor {
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
             let (source_window, transfer_id) = {
-                let dnd = self.target.dnd.borrow();
-                let Some(state) = dnd.state() else {
-                    warn!("Received `XdndDrop` without `XdndEnter`");
+                let mut dnd = self.target.dnd.borrow_mut();
+                let Some(state) = dnd.state_mut().filter(|state| {
+                    state.matches_drag(xev.data.get_long(0) as xproto::Window, window)
+                }) else {
+                    warn!("Received `XdndDrop` without a matching active drag");
                     return;
                 };
                 let source_window = state.source_window;
+                // Mark release before invoking user code, retaining any in-flight conversions.
+                state.finished = Some((window, source_window));
 
                 (source_window, state.transfer_id)
             };
 
-            app.window_event(
-                &self.target,
-                window_id,
-                // TODO
-                WindowEvent::DragDropped {
-                    id: transfer_id,
-                    // `Copy` is the default. Other actions are possible in X11, but the
-                    // specification does not properly explain how to implement
-                    // them (only giving a vague description of `XdndMove`). For
-                    // simplicity's sake, we simply do not implement non-copy drag
-                    // on X11.
-                    // See https://www.freedesktop.org/wiki/Specifications/XDND/
-                    proposed_action: Some(DndAction::Copy),
-                },
-            );
+            app.window_event(&self.target, window_id, WindowEvent::DragDropped {
+                id: transfer_id,
+                // `Copy` is the default. Other actions are possible in X11, but the
+                // specification does not properly explain how to implement
+                // them (only giving a vague description of `XdndMove`). For
+                // simplicity's sake, we simply do not implement non-copy drag
+                // on X11.
+                // See https://www.freedesktop.org/wiki/Specifications/XDND/
+                proposed_action: Some(DndAction::Copy),
+            });
 
             let mut dnd = self.target.dnd.borrow_mut();
 
-            if let Some(state) =
-                dnd.state_mut().filter(|state| !state.pending_fetch_types.is_empty())
-            {
-                state.finished = Some((window, source_window));
-            } else {
+            if dnd.state().is_some_and(|state| state.pending_fetch_types.is_empty()) {
                 unsafe {
                     dnd.send_finished(window, source_window)
                         .expect("Failed to send `XdndFinished` message.");
@@ -583,8 +586,17 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndLeave] as c_ulong {
-            let Some(state) = self.target.dnd.borrow_mut().reset_state() else {
-                return;
+            let state = {
+                let mut dnd = self.target.dnd.borrow_mut();
+                if !dnd.state().is_some_and(|state| {
+                    state.matches_drag(xev.data.get_long(0) as xproto::Window, window)
+                }) {
+                    return;
+                }
+                let Some(state) = dnd.reset_state() else {
+                    return;
+                };
+                state
             };
             app.window_event(&self.target, window_id, WindowEvent::DragLeft {
                 id: state.transfer_id,
@@ -597,21 +609,17 @@ impl EventProcessor {
 
         let xwindow = xev.requestor as xproto::Window;
 
-        // Set the timestamp.
-        self.target.xconn.set_timestamp(xev.time as xproto::Timestamp);
-
         // For now, winit only supports selections for drag-and-drop. This should be changed
         // when clipboard support is implemented.
-        if xev.property != atoms[XdndSelection] as c_ulong {
+        // A refused conversion has property None but still completes the outstanding request.
+        if xev.selection != atoms[XdndSelection] as c_ulong
+            || (xev.property != 0 && xev.property != atoms[XdndSelection] as c_ulong)
+        {
             return;
         }
 
-        let (transfer_id, serial, type_) = {
+        let (transfer_id, window, serial, type_) = {
             let Some(state) = self.target.dnd.get_mut().state_mut() else {
-                return;
-            };
-
-            let Some((serial, type_)) = state.pending_fetch_types.pop_front() else {
                 return;
             };
 
@@ -623,66 +631,58 @@ impl EventProcessor {
             #[cfg(target_pointer_width = "64")]
             let target_type = xev.target as u32;
 
-            if target_type != type_.atom() {
-                let get_name = |atom| {
-                    self.target
-                        .xconn
-                        .xcb_connection()
-                        .get_atom_name(atom)
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .and_then(|reply| String::from_utf8(reply.name).ok())
-                };
-
-                let expected_type_name = get_name(type_.atom());
-                let found_type_name = get_name(xev.type_ as _);
-
-                let extra_context = match (expected_type_name, found_type_name) {
-                    (Some(expected), Some(found)) => {
-                        format!(" (expected {expected}, found {found})")
-                    },
-                    (Some(expected), None) => format!(" (expected {expected})"),
-                    (None, Some(found)) => format!(" (found {found})"),
-                    (None, None) => "".to_string(),
-                };
-                warn!(
-                    "Received `SelectionNotify` with unexpected type{extra_context}. Continuing, \
-                     but this may be a bug."
-                );
-            }
-
-            (state.transfer_id, serial, type_)
-        };
-
-        let value = match self.target.dnd.borrow().read_data(xwindow, type_) {
-            Ok(value) => Arc::new(value),
-            Err(err) => {
-                warn!("Failed to read selection: {err}");
+            let Some((serial, type_)) =
+                state.take_selection_reply(xwindow, target_type, xev.time as xproto::Timestamp)
+            else {
                 return;
-            },
+            };
+
+            (state.transfer_id, state.target_window, serial, type_)
         };
 
-        let window_id = mkwid(xwindow);
+        self.target.xconn.set_timestamp(xev.time as xproto::Timestamp);
 
-        app.window_event(&self.target, window_id, WindowEvent::DataTransferReceived {
+        let value = if xev.property == 0 {
+            warn!("Drag source refused selection conversion");
+            if let Some(state) = self.target.dnd.get_mut().state_mut() {
+                state.accepted = false;
+            }
+            SelectionReader::failed(type_, std::io::Error::other("Selection conversion refused"))
+        } else {
+            let value = self.target.dnd.borrow().read_data(xwindow, type_.clone());
+            match value {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!("Failed to read selection: {err}");
+                    if let Some(state) = self.target.dnd.get_mut().state_mut() {
+                        state.accepted = false;
+                    }
+                    SelectionReader::failed(type_, std::io::Error::other(err.to_string()))
+                },
+            }
+        };
+
+        app.window_event(&self.target, mkwid(window), WindowEvent::DataTransferReceived {
             id: transfer_id,
             serial,
-            value,
+            value: Arc::new(value),
         });
 
         let mut dnd = self.target.dnd.borrow_mut();
 
         // If we have another fetch pending, request it from the drag source window
-        if let Some((window, type_)) = dnd.state().and_then(|state| {
-            state
-                .pending_fetch_types
-                .front()
-                .cloned()
-                .map(|(_, type_)| (state.target_window, type_))
-        }) {
-            dnd.convert_selection(window, self.target.xconn.timestamp(), type_.atom());
-        } else if let Some((this_window, target_window)) =
-            dnd.state().and_then(|state| state.finished)
+        if let Some(type_) = dnd
+            .state()
+            .filter(|state| state.pending_request_time.is_none())
+            .and_then(|state| state.pending_fetch_types.front().map(|(_, type_)| type_.clone()))
+        {
+            dnd.convert_selection(self.target.xconn.timestamp(), type_.atom());
+        } else if let Some((this_window, target_window)) = dnd
+            .state()
+            .filter(|state| {
+                state.pending_fetch_types.is_empty() && state.pending_request_time.is_none()
+            })
+            .and_then(|state| state.finished)
         {
             unsafe {
                 dnd.send_finished(this_window, target_window)
